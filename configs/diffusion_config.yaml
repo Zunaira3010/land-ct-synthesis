@@ -1,0 +1,54 @@
+# ============================================================================
+# 3D Diffusion U-Net configuration
+# Paper Section 2 "3D U-Net"
+# ============================================================================
+
+architecture:
+  in_channels: 4               # latent channels from VAE
+  out_channels: 4
+  num_resolution_levels: 5     # paper: "5 resolution levels"
+  num_res_blocks_per_level: 2  # paper: "two residual blocks per level"
+  skip_connection_type: "additive"   # paper explicitly calls out additive (not concat) skip connections, citing PatchDDM [2]
+  # Not stated explicitly in the paper; MONAI DiffusionModelUNet-style default that scales
+  # reasonably from a 64^3 latent down to a 4x4x4 bottleneck over 5 levels.
+  channels: [64, 128, 256, 384, 512]
+  attention_levels: [false, false, true, true, true]   # cross-attention only at coarser levels, standard LDM practice
+  num_head_channels: 64
+  cross_attention_dim: 8       # conditioning mask has 1 channel (lung+nodule combined); adjust once mask encoder is finalized
+  norm_num_groups: 32
+
+conditioning:
+  # Paper: "Masks are normalized to [0,1], downsampled four times via 3D max pooling,
+  # concatenated with the noisy latent, and injected into U-Net cross-attention layers."
+  mode: "concat_and_cross_attention"   # BOTH concatenation AND cross-attention per paper's wording
+  mask_channels: 1
+  mask_spatial_shape: [64, 64, 64]     # after 4x max-pool downsample, matches latent spatial size
+
+diffusion_process:
+  num_train_timesteps: 1000    # paper: T = 1000
+  num_inference_timesteps: 1000  # paper: "Inference uses the same number of steps to prioritize sample quality"
+  schedule: "linear"
+  beta_start: 1.0e-4           # paper: beta_1 = 1e-4
+  beta_end: 0.02               # paper: beta_T = 0.02
+  prediction_type: "v_prediction"   # paper: "velocity prediction"
+  min_snr_gamma: 5.0           # paper cites Min-SNR-gamma [9]; gamma=5 is the value proposed/validated in that paper, not explicitly restated in LAND
+
+training:
+  num_steps: 500000            # paper: "500k steps"
+  batch_size: 1                # paper: "batch size 1"
+  optimizer: "AdamW"
+  learning_rate: 1.0e-5         # paper: "learning rate 1e-5"
+  weight_decay: 1.0e-5
+  ema_decay: 0.9999             # not stated by paper; standard practice for diffusion training, disable if reproducing literally
+  mixed_precision: "bf16"
+  gradient_checkpointing: true
+  gradient_accumulation_steps: 4
+  cfg_dropout_prob: 0.1         # classifier-free-guidance-style conditioning dropout; not stated in paper -- optional, see notes.md
+  val_every_n_steps: 5000
+  checkpoint_every_n_steps: 10000
+  log_every_n_steps: 100
+
+hardware:
+  reference_gpu: "A100-20GB"
+  reference_train_memory_gb: 20   # arXiv v1 figure; published Sci Rep version reports 10-16GB
+  reference_inference_memory_gb: 7.5

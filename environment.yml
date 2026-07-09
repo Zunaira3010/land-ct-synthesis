@@ -1,0 +1,47 @@
+name: land-ct
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy<2.0
+  - pip:
+      # --- Core DL stack ---
+      # Match this to whatever CUDA the training GPU actually has.
+      # Local dev machine (GTX 1080, CUDA 12.6 driver) -> cu121 wheels work fine for dev/debug.
+      # On the rented training GPU, re-pin to match its CUDA version if different.
+      - torch==2.4.1
+      - torchvision==0.19.1
+
+      # --- MONAI + generative models (VAE / DiffusionModelUNet scaffolding) ---
+      - monai==1.4.0
+      - monai-generative==0.2.3
+
+      # --- Medical image IO / preprocessing ---
+      - SimpleITK==2.4.0
+      - nibabel==5.2.1
+      - pydicom==2.4.4
+      - pylidc==0.2.3          # LIDC-IDRI XML annotation parsing (nodule contours + texture ratings)
+      - lungmask==0.2.20       # Hofmanninger et al. pretrained lung segmentation U-Net (paper's ref [13])
+      - scikit-image==0.24.0
+      - scipy==1.14.1
+
+      # --- Losses / metrics ---
+      - lpips==0.1.4           # perceptual loss term (L_LPIPS)
+      - torchmetrics==1.4.2
+      - pytorch-fid==0.3.0     # FID (paper uses a medical ResNet-50 feature extractor instead, see notes.md)
+
+      # --- Config / experiment management ---
+      - omegaconf==2.3.0
+      - pyyaml==6.0.2
+
+      # --- Training utilities ---
+      - tqdm==4.66.5
+      - tensorboard==2.17.1
+      - einops==0.8.0
+
+      # --- Dev / testing ---
+      - pytest==8.3.3

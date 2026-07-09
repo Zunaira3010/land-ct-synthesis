@@ -1,0 +1,52 @@
+# ============================================================================
+# 3D VAE configuration
+# Paper Section 2 "3D VAE": lightweight variant of the MAISI architecture [8]
+# ============================================================================
+
+architecture:
+  in_channels: 1
+  out_channels: 1
+  latent_channels: 4          # paper: 64x64x64x4 latent for a 256^3 input
+  spatial_compression: 4      # paper: "compressing 4x the spatial resolution"
+  num_resolution_levels: 3    # paper: "3 resolution levels"
+  num_res_blocks_per_level: 1 # paper: "one residual block per level"
+  # Paper says "the same number of channels in both encoder and decoder" but does not give the
+  # exact channel list. Using MAISI's published lightweight config as the starting point;
+  # revisit if reconstruction quality doesn't match paper's qualitative results.
+  channels: [64, 128, 256]
+  attention_levels: [false, false, false]   # MAISI's lightweight VAE variant has no self-attn in the VAE
+  norm_num_groups: 32
+  use_checkpointing: true      # gradient checkpointing -- needed to fit on an 8GB dev GPU at small batch
+
+loss:
+  # Paper: L_VAE = L_MAE + L_LPIPS + L_ADV + L_KL
+  mae_weight: 1.0
+  lpips_weight: 1.0
+  adversarial_weight: 0.1     # not stated in paper -- standard LDM/MAISI default, tune during Stage 3
+  kl_weight: 1.0e-6           # standard small KL weight for KL-regularized autoencoders (Rombach et al.)
+  perceptual_2p5d: true       # run LPIPS per-axis on 2D slices (axial/coronal/sagittal), average -- LPIPS has no native 3D model
+
+discriminator:
+  # Needed for L_ADV; paper doesn't specify discriminator architecture -- using a standard
+  # 3D PatchGAN discriminator (as used in MAISI / Rombach et al. autoencoders).
+  base_channels: 32
+  num_layers: 3
+
+training:
+  epochs: 100                 # paper: "trained independently for 100 epochs"
+  batch_size: 1                # paper: "batch size 1"
+  optimizer: "AdamW"
+  learning_rate: 1.0e-4        # paper: "learning rate 1e-4"
+  weight_decay: 1.0e-5
+  discriminator_learning_rate: 1.0e-4
+  gradient_checkpointing: true
+  mixed_precision: "bf16"      # not specified by paper; needed for memory budget on both dev and rented GPU
+  gradient_accumulation_steps: 4  # paper trains on a 20GB GPU at batch 1; smaller GPUs need accumulation
+  val_every_n_epochs: 5
+  checkpoint_every_n_epochs: 5
+  discriminator_warmup_epochs: 10   # start adversarial loss after encoder/decoder have stabilized
+
+hardware:
+  # Paper: trained on a single Nvidia Grid A100-20C (20GB)
+  reference_gpu: "A100-20GB"
+  reference_train_memory_gb: 20

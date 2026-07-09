@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+checkpoints/*
+!checkpoints/.gitkeep
+logs/*
+!logs/.gitkeep
+data/
+*.nii.gz
+*.mhd
+*.raw
+*.dcm
+.ipynb_checkpoints/
+*.egg-info/
+.env
