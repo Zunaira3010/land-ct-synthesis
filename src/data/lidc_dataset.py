@@ -13,6 +13,7 @@ tests/test_stage2_preprocessing.py for the synthetic-loader pattern. The default
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -81,8 +82,11 @@ class LIDCVolumeDataset(Dataset):
         self.cache_dir = cache_dir
         self.mask_downsample_factor = mask_downsample_factor
         # Default loader is bound to cache_dir; tests inject their own single-arg loader.
-        self._volume_loader = volume_loader or (
-            lambda s: load_cached_npz(s, cache_dir=self.cache_dir)
+        # Uses functools.partial (not a lambda/closure) so the dataset stays picklable --
+        # required on Windows, where DataLoader(num_workers>0) uses spawn and must pickle
+        # the whole dataset object to hand it to worker processes.
+        self._volume_loader = volume_loader or partial(
+            load_cached_npz, cache_dir=self.cache_dir
         )
 
     def __len__(self) -> int:

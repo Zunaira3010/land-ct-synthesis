@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -30,6 +31,15 @@ from src.data.io import get_scan_for_patient, build_nodule_mask, load_dicom_seri
 from src.data.lung_mask import segment_lungs
 from src.data.masks import encode_conditioning_mask, make_healthy_mask
 from src.data.preprocessing import preprocess_ct_volume, preprocess_mask_volume
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Format a duration in seconds as e.g. '1m 23s' or '45s'."""
+    seconds = int(round(seconds))
+    m, s = divmod(seconds, 60)
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
 
 
 def process_one(entry: dict, cache_dir: Path, target_shape=(256, 256, 256)) -> None:
@@ -76,29 +86,80 @@ def main():
     parser.add_argument("--manifest", type=str, required=True)
     parser.add_argument("--cache-dir", type=str, required=True)
     parser.add_argument("--limit", type=int, default=None,
-                         help="only process the first N entries across all splits -- smoke test")
+                         help="only process this many entries starting from --offset -- for chunked runs")
+    parser.add_argument("--offset", type=int, default=0,
+                         help="skip this many entries from the start of the manifest before processing "
+                              "-- combine with --limit to process the dataset in resumable chunks, "
+                              "e.g. --offset 0 --limit 12, then --offset 12 --limit 12, etc.")
+    parser.add_argument("--overwrite", action="store_true",
+                         help="reprocess patients even if a cached .npz already exists for them "
+                              "(default: skip already-cached patients, so re-running a chunk is safe/cheap)")
     args = parser.parse_args()
 
     with open(args.manifest) as f:
         splits = json.load(f)
 
     all_entries = splits["train"] + splits["val"] + splits["test"]
+
+    # Apply offset first, then limit -- lets you carve the full list into fixed-size chunks
+    # without ever reprocessing earlier chunks, e.g.:
+    #   chunk 1: --offset 0  --limit 12   (entries 0-11)
+    #   chunk 2: --offset 12 --limit 12   (entries 12-23)
+    #   ...
+    windowed_entries = all_entries[args.offset:]
     if args.limit:
-        all_entries = all_entries[:args.limit]
+        windowed_entries = windowed_entries[:args.limit]
 
     cache_dir = Path(args.cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    skipped_cached = []
+    to_process = []
+    for entry in windowed_entries:
+        out_path = cache_dir / f"{entry['patient_id']}.npz"
+        if out_path.exists() and not args.overwrite:
+            skipped_cached.append(entry["patient_id"])
+        else:
+            to_process.append(entry)
+
+    if skipped_cached:
+        print(f"Skipping {len(skipped_cached)} already-cached patients "
+              f"(use --overwrite to force reprocessing): {skipped_cached}\n")
+
+    print(f"This run: {len(to_process)} patients "
+          f"(manifest offset {args.offset}..{args.offset + len(windowed_entries) - 1})\n")
+
     failures = []
-    for i, entry in enumerate(all_entries):
+    patient_durations = []
+    run_start = time.monotonic()
+
+    for i, entry in enumerate(to_process):
         patient_id = entry["patient_id"]
-        print(f"[{i+1}/{len(all_entries)}] {patient_id} (healthy={entry['is_healthy']}) ...", flush=True)
+        elapsed_total = time.monotonic() - run_start
+        print(f"[{i+1}/{len(to_process)}] {patient_id} (healthy={entry['is_healthy']}) "
+              f"... (elapsed so far: {_fmt_duration(elapsed_total)})", flush=True)
+
+        patient_start = time.monotonic()
         try:
             process_one(entry, cache_dir)
+            patient_time = time.monotonic() - patient_start
+            patient_durations.append(patient_time)
+            avg_time = sum(patient_durations) / len(patient_durations)
+            remaining = len(to_process) - (i + 1)
+            eta = avg_time * remaining
+            print(f"  done in {_fmt_duration(patient_time)}  "
+                  f"(avg {_fmt_duration(avg_time)}/patient, "
+                  f"~{_fmt_duration(eta)} left for this chunk)", flush=True)
         except Exception as exc:  # noqa: BLE001 -- keep going, report all failures at the end
-            print(f"  FAILED: {exc}")
+            patient_time = time.monotonic() - patient_start
+            print(f"  FAILED after {_fmt_duration(patient_time)}: {exc}")
             traceback.print_exc()
             failures.append((patient_id, str(exc)))
 
-    print(f"\nDone. {len(all_entries) - len(failures)}/{len(all_entries)} succeeded.")
+    total_elapsed = time.monotonic() - run_start
+    print(f"\nDone. {len(to_process) - len(failures)}/{len(to_process)} succeeded this run "
+          f"({len(skipped_cached)} skipped as already-cached). "
+          f"Total time: {_fmt_duration(total_elapsed)}")
     if failures:
         print(f"{len(failures)} failures:")
         for patient_id, reason in failures:
