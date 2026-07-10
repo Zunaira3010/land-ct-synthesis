@@ -125,16 +125,27 @@ def build_nodule_mask(scan, volume_shape: tuple[int, int, int]) -> tuple[np.ndar
     # Pick the cluster with the most radiologist agreement (most annotations), tie-broken by
     # largest resulting volume.
     largest_cluster = max(clusters, key=len)
-
-    mask = np.zeros(volume_shape, dtype=bool)
+# pylidc's Annotation.bbox()/boolean_mask() are defined relative to scan.to_volume(),
+    # whose array axis order is (row, col, slice) -- i.e. the z axis is LAST. This is the
+    # opposite of SimpleITK's GetArrayFromImage() order (z, y, x) used everywhere else in
+    # this pipeline (volume_shape). Build the mask in pylidc's native orientation first,
+    # then transpose into (z, y, x) so it aligns with the CT array.
+    pylidc_shape = scan.to_volume().shape
+    pylidc_mask = np.zeros(pylidc_shape, dtype=bool)
     texture_scores = []
     for annotation in largest_cluster:
-        ann_mask, bbox = annotation.get_boolean_mask(return_bbox=True)
-        # bbox is a tuple of (start, stop) index pairs in (row, col, slice) order matching
-        # the scan's native volume array.
-        slices = tuple(slice(int(b[0]), int(b[1]) + 1) for b in bbox)
-        mask[slices] |= ann_mask
+        ann_mask = annotation.boolean_mask()
+        bbox = annotation.bbox()
+        pylidc_mask[bbox] |= ann_mask
         texture_scores.append(annotation.texture)
+
+    # (row, col, slice) -> (slice, row, col) == (z, y, x)
+    mask = np.transpose(pylidc_mask, (2, 0, 1))
+    if mask.shape != volume_shape:
+        raise RuntimeError(
+            f"Nodule mask shape {mask.shape} does not match expected CT volume shape "
+            f"{volume_shape} for scan {scan.patient_id} -- check DICOM series consistency."
+        )
 
     texture_score = int(round(float(np.mean(texture_scores))))
     texture_score = min(max(texture_score, 1), 5)
