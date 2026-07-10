@@ -5,7 +5,7 @@ checkpoints/*
 !checkpoints/.gitkeep
 logs/*
 !logs/.gitkeep
-data/
+/data/
 *.nii.gz
 *.mhd
 *.raw
