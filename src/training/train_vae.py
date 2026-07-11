@@ -47,6 +47,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import math
 import os
@@ -85,6 +86,28 @@ def _collate(batch: list[dict]) -> dict:
         "texture_score": [b["texture_score"] for b in batch],
         "patient_id":    [b["patient_id"]    for b in batch],
     }
+
+
+# ---------------------------------------------------------------------------
+# Time formatting (elapsed / ETA reporting)
+# ---------------------------------------------------------------------------
+
+def _format_duration(seconds: float) -> str:
+    """e.g. 7384.2 -> '2h 3m 4s'. Drops leading zero units for readability."""
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def _format_clock_eta(seconds_from_now: float) -> str:
+    """e.g. 7384.2 -> 'Mon 14:32' -- wall-clock time training is expected to finish."""
+    eta = datetime.datetime.now() + datetime.timedelta(seconds=max(0, seconds_from_now))
+    return eta.strftime("%a %H:%M")
 
 
 # ---------------------------------------------------------------------------
@@ -281,10 +304,12 @@ def _train_epoch(
     out_dir: Path,
     checkpoint_every_n_steps: int | None,
     best_val_loss: float,
+    n_batches: int,
 ) -> dict[str, float]:
 
     vae.train()
     discriminator.train()
+    epoch_t0 = time.time()
 
     amp_dtype = torch.bfloat16 if (use_amp and device == "cuda") else torch.float32
     accum_log: dict[str, list[float]] = {}
@@ -360,11 +385,24 @@ def _train_epoch(
             if checkpoint_every_n_steps and global_step[0] % checkpoint_every_n_steps == 0:
                 _save_latest(f"periodic, every {checkpoint_every_n_steps} steps")
 
+        # ── Live progress line (overwrites in place, doesn't spam the terminal) ──────────
+        step_elapsed = time.time() - epoch_t0
+        avg_step_time = step_elapsed / (step + 1)
+        steps_left = n_batches - (step + 1)
+        eta_this_epoch = avg_step_time * steps_left
+        print(f"\r    step {step+1}/{n_batches} "
+              f"({100*(step+1)/n_batches:5.1f}%) | "
+              f"epoch elapsed {_format_duration(step_elapsed)} | "
+              f"epoch ETA {_format_duration(eta_this_epoch)}",
+              end="", flush=True)
+
         # ── Graceful-interrupt check (Ctrl+C / SIGTERM -- NOT a hard kill, see note above) ──
         if _shutdown_requested[0]:
+            print()  # move off the in-place progress line before printing the save message
             _save_latest("graceful interrupt signal received")
             raise TrainingInterrupted(f"Stopped by signal during epoch {epoch}, step {step}")
 
+    print()  # newline after the in-place step-progress line, so later prints start clean
     # Epoch-mean across all steps
     return {}   # per-step logging is done above; caller computes epoch means from epoch val
 
@@ -579,6 +617,9 @@ def train(
     print(f"  checkpoint_every_n_steps={ckpt_every_n_steps or 'disabled'}  "
           f"(resume from: {out_dir / 'latest.pt'})\n")
 
+    run_start_time = time.time()  # for elapsed/ETA reporting -- resets each process launch,
+                                   # so after a resume this tracks *this run's* time, not the
+                                   # cumulative time across all runs/resumes
     try:
         for epoch in range(start_epoch, n_epochs):
             t0 = time.time()
@@ -602,10 +643,22 @@ def train(
                 out_dir=out_dir,
                 checkpoint_every_n_steps=ckpt_every_n_steps,
                 best_val_loss=best_val_loss,
+                n_batches=len(train_loader),
             )
 
             elapsed = time.time() - t0
             print(f"  Epoch time: {elapsed:.1f}s", flush=True)
+
+            # ── Overall run progress: elapsed so far, estimated remaining, projected finish ──
+            epochs_done_this_run = epoch - start_epoch + 1
+            total_elapsed = time.time() - run_start_time
+            avg_epoch_time = total_elapsed / epochs_done_this_run
+            remaining_epochs = n_epochs - (epoch + 1)
+            eta_seconds = avg_epoch_time * remaining_epochs
+            print(f"  Total elapsed: {_format_duration(total_elapsed)} | "
+                  f"Est. remaining: {_format_duration(eta_seconds)} "
+                  f"({remaining_epochs} epochs left) | "
+                  f"Projected finish: {_format_clock_eta(eta_seconds)}", flush=True)
 
             # ── Validation ──────────────────────────────────────────────────
             if (epoch + 1) % val_every == 0 or epoch == n_epochs - 1:
