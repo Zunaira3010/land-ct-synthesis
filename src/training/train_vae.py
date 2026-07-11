@@ -49,6 +49,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -124,6 +126,45 @@ def _build_dataset(
 
 
 # ---------------------------------------------------------------------------
+# Graceful-interrupt handling (shared-machine safety)
+# ---------------------------------------------------------------------------
+#
+# IMPORTANT LIMITATION: this only helps for a *graceful* interrupt -- Ctrl+C (SIGINT), or on
+# some setups a plain `kill <pid>` / closing a terminal cleanly (SIGTERM). It does NOT and
+# CANNOT help if the process is force-killed (`taskkill /F`, Task Manager "End Task", or VS Code
+# forcibly closing a terminal's process tree) -- the OS terminates the process immediately in
+# that case and no Python code gets to run, signal handler or not. The real defense against a
+# hard kill is the periodic step-level checkpoint below (`checkpoint_every_n_steps`), which
+# bounds how much progress you can lose to *any* kind of kill, graceful or not, to at most that
+# many optimiser steps -- not this signal handler.
+
+_shutdown_requested = [False]
+
+
+def _request_shutdown(signum, frame) -> None:
+    # Signal handlers should do as little as possible -- just set a flag. The actual checkpoint
+    # save happens back in normal Python code (the training loop), not here.
+    if not _shutdown_requested[0]:
+        print(f"\n  [signal {signum} received] Saving a checkpoint and stopping after the "
+              f"current step (send the signal again to force-quit without saving)...", flush=True)
+    _shutdown_requested[0] = True
+
+
+def _install_signal_handlers() -> None:
+    signal.signal(signal.SIGINT, _request_shutdown)   # Ctrl+C, all platforms
+    try:
+        signal.signal(signal.SIGTERM, _request_shutdown)   # graceful kill; POSIX-reliable
+    except (ValueError, AttributeError, OSError):
+        pass
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _request_shutdown)  # Windows Ctrl+Break
+
+
+class TrainingInterrupted(Exception):
+    """Raised internally to unwind cleanly out of the epoch loop after an interrupt-save."""
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
@@ -134,23 +175,43 @@ def _save_checkpoint(
     discriminator: PatchGAN3D,
     vae_optim: torch.optim.Optimizer,
     disc_optim: torch.optim.Optimizer,
+    scaler_vae: GradScaler,
+    scaler_disc: GradScaler,
+    global_step: int,
     best_val_loss: float,
+    epoch_complete: bool,
     tag: str = "",
+    filename: str | None = None,
 ) -> None:
+    """Save full training state. `epoch_complete=False` marks a mid-epoch safety checkpoint
+    (periodic or interrupt-triggered) -- see `_load_checkpoint` for how that affects resume.
+
+    Writes to a temp file and atomically renames it into place (`Path.replace`, atomic on both
+    POSIX and Windows when src/dst are on the same volume), so a kill that lands mid-`torch.save`
+    corrupts only the .tmp file, never the checkpoint you'd actually try to resume from.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
-    fname = f"vae_epoch{epoch:04d}{('_' + tag) if tag else ''}.pt"
+    fname = filename or f"vae_epoch{epoch:04d}{('_' + tag) if tag else ''}.pt"
+    final_path = out_dir / fname
+    tmp_path = out_dir / (fname + ".tmp")
     torch.save(
         {
             "epoch":          epoch,
+            "epoch_complete": epoch_complete,
+            "global_step":    global_step,
             "vae_state":      vae.state_dict(),
             "disc_state":     discriminator.state_dict(),
             "vae_optim":      vae_optim.state_dict(),
             "disc_optim":     disc_optim.state_dict(),
+            "scaler_vae":     scaler_vae.state_dict(),
+            "scaler_disc":    scaler_disc.state_dict(),
             "best_val_loss":  best_val_loss,
         },
-        out_dir / fname,
+        tmp_path,
     )
-    print(f"  Saved checkpoint: {out_dir / fname}")
+    os.replace(tmp_path, final_path)
+    print(f"  Saved checkpoint: {final_path}"
+          f"{' (mid-epoch safety checkpoint)' if not epoch_complete else ''}", flush=True)
 
 
 def _load_checkpoint(
@@ -159,19 +220,43 @@ def _load_checkpoint(
     discriminator: PatchGAN3D,
     vae_optim: torch.optim.Optimizer | None = None,
     disc_optim: torch.optim.Optimizer | None = None,
-) -> tuple[int, float]:
-    """Returns (start_epoch, best_val_loss)."""
+    scaler_vae: GradScaler | None = None,
+    scaler_disc: GradScaler | None = None,
+) -> tuple[int, int, float]:
+    """Returns (start_epoch, global_step, best_val_loss).
+
+    If the checkpoint was saved mid-epoch (epoch_complete=False -- a periodic `latest.pt` safety
+    checkpoint, or one saved on interrupt), start_epoch is the SAME epoch it was interrupted in,
+    so that epoch gets a full, fresh pass over the data rather than trying to resume partway
+    through a DataLoader iterator (not easily resumable, especially with num_workers>0 and
+    randomized patch sampling). You may redo a handful of already-applied optimiser steps this
+    way, but you never lose the model/optimiser weights already achieved within that epoch --
+    only the bookkeeping of exactly which batches were already seen.
+    """
     ckpt = torch.load(ckpt_path, map_location="cpu")
     vae.load_state_dict(ckpt["vae_state"])
     discriminator.load_state_dict(ckpt["disc_state"])
-    if vae_optim and "vae_optim" in ckpt:
+    if vae_optim is not None and "vae_optim" in ckpt:
         vae_optim.load_state_dict(ckpt["vae_optim"])
-    if disc_optim and "disc_optim" in ckpt:
+    if disc_optim is not None and "disc_optim" in ckpt:
         disc_optim.load_state_dict(ckpt["disc_optim"])
-    start_epoch = ckpt.get("epoch", 0) + 1
+    if scaler_vae is not None and "scaler_vae" in ckpt:
+        scaler_vae.load_state_dict(ckpt["scaler_vae"])
+    if scaler_disc is not None and "scaler_disc" in ckpt:
+        scaler_disc.load_state_dict(ckpt["scaler_disc"])
+
+    # Checkpoints saved before this feature existed have no "epoch_complete" key -- they were
+    # always full-epoch saves, so default True keeps old checkpoints resuming the same way they
+    # always did.
+    epoch_complete = ckpt.get("epoch_complete", True)
+    start_epoch = ckpt["epoch"] + 1 if epoch_complete else ckpt["epoch"]
+    global_step = ckpt.get("global_step", 0)
     best_val_loss = ckpt.get("best_val_loss", math.inf)
-    print(f"  Resumed from checkpoint epoch {ckpt['epoch']} (best val loss={best_val_loss:.4f})")
-    return start_epoch, best_val_loss
+
+    status = "complete" if epoch_complete else "IN-PROGRESS (resuming this same epoch fresh)"
+    print(f"  Resumed from checkpoint: epoch {ckpt['epoch']} ({status}), "
+          f"global_step={global_step}, best val loss={best_val_loss:.4f}")
+    return start_epoch, global_step, best_val_loss
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +278,9 @@ def _train_epoch(
     use_amp: bool,
     writer: SummaryWriter | None,
     global_step: list[int],   # mutable int wrapped in list so we can update it
+    out_dir: Path,
+    checkpoint_every_n_steps: int | None,
+    best_val_loss: float,
 ) -> dict[str, float]:
 
     vae.train()
@@ -200,6 +288,14 @@ def _train_epoch(
 
     amp_dtype = torch.bfloat16 if (use_amp and device == "cuda") else torch.float32
     accum_log: dict[str, list[float]] = {}
+
+    def _save_latest(reason: str) -> None:
+        _save_checkpoint(
+            out_dir, epoch, vae, discriminator, vae_optim, disc_optim,
+            scaler_vae, scaler_disc, global_step[0], best_val_loss,
+            epoch_complete=False, filename="latest.pt",
+        )
+        print(f"    (saved because: {reason})", flush=True)
 
     vae_optim.zero_grad(set_to_none=True)
     disc_optim.zero_grad(set_to_none=True)
@@ -260,6 +356,15 @@ def _train_epoch(
             global_step[0] += 1
             accum_log = {}
 
+            # ── Periodic safety checkpoint (protects against ANY kill, graceful or not) ──
+            if checkpoint_every_n_steps and global_step[0] % checkpoint_every_n_steps == 0:
+                _save_latest(f"periodic, every {checkpoint_every_n_steps} steps")
+
+        # ── Graceful-interrupt check (Ctrl+C / SIGTERM -- NOT a hard kill, see note above) ──
+        if _shutdown_requested[0]:
+            _save_latest("graceful interrupt signal received")
+            raise TrainingInterrupted(f"Stopped by signal during epoch {epoch}, step {step}")
+
     # Epoch-mean across all steps
     return {}   # per-step logging is done above; caller computes epoch means from epoch val
 
@@ -315,6 +420,7 @@ def train(
     device_override: str | None = None,
     patch_size: int | None = None,
     nodule_centered_prob: float | None = None,
+    checkpoint_every_n_steps: int | None = None,
 ) -> None:
     """
     Main VAE training entry point.
@@ -326,7 +432,9 @@ def train(
     out_dir          : where to save checkpoints + TensorBoard logs
     vae_config_path  : path to vae_config.yaml
     data_config_path : path to data_config.yaml
-    resume_from      : optional path to a .pt checkpoint to resume from
+    resume_from      : optional path to a .pt checkpoint to resume from (use
+                        `<out_dir>/latest.pt` to resume from the most recent safety checkpoint,
+                        which is at most `checkpoint_every_n_steps` steps stale)
     epochs           : override number of training epochs (default: from vae_config.yaml)
     limit            : only use the first N training samples (smoke-test)
     no_lpips         : disable LPIPS loss (faster, useful for debugging)
@@ -338,6 +446,13 @@ def train(
     nodule_centered_prob : probability a tumor-sample patch is centered on a real nodule voxel
                         instead of a uniform-random crop (default: from data_config.yaml
                         `patch.nodule_centered_prob`). Ignored if patch_size is None.
+    checkpoint_every_n_steps : save a `latest.pt` safety checkpoint (full state: weights,
+                        optimisers, AMP scalers, epoch, global_step) every N optimiser steps, in
+                        addition to the normal end-of-epoch checkpoints (default: from
+                        vae_config.yaml `training.checkpoint_every_n_steps`). This -- not the
+                        Ctrl+C signal handler -- is what actually bounds your worst-case lost
+                        progress on a shared machine, since a hard kill (closed terminal window,
+                        `taskkill /F`) can't be intercepted at all.
     """
     # ── Config ──────────────────────────────────────────────────────────────
     cfg = load_config(vae=vae_config_path, data=data_config_path)
@@ -436,79 +551,104 @@ def train(
     scaler_vae  = GradScaler(enabled=use_amp)
     scaler_disc = GradScaler(enabled=use_amp)
 
+    # ── Shared-machine safety: catch Ctrl+C / graceful kill (NOT a hard kill -- see the note
+    # above _request_shutdown). Installed before the loop so an early interrupt is still caught.
+    _install_signal_handlers()
+
     # ── Resume ──────────────────────────────────────────────────────────────
-    start_epoch   = 0
-    best_val_loss = math.inf
+    start_epoch     = 0
+    best_val_loss   = math.inf
+    resumed_step    = 0
     if resume_from:
-        start_epoch, best_val_loss = _load_checkpoint(
-            resume_from, vae, discriminator, vae_optim, disc_optim
+        start_epoch, resumed_step, best_val_loss = _load_checkpoint(
+            resume_from, vae, discriminator, vae_optim, disc_optim, scaler_vae, scaler_disc
         )
 
     # ── TensorBoard ─────────────────────────────────────────────────────────
     writer = SummaryWriter(log_dir=str(out_dir / "tb_logs"))
 
     # ── Training loop ────────────────────────────────────────────────────────
-    global_step = [0]   # mutable container so _train_epoch can increment it
+    global_step = [resumed_step]   # mutable container so _train_epoch can increment it
     val_every   = int(train_cfg.val_every_n_epochs)
     ckpt_every  = int(train_cfg.checkpoint_every_n_epochs)
+    ckpt_every_n_steps = (
+        checkpoint_every_n_steps if checkpoint_every_n_steps is not None
+        else (int(train_cfg.checkpoint_every_n_steps)
+              if getattr(train_cfg, "checkpoint_every_n_steps", None) else None)
+    )
+    print(f"  checkpoint_every_n_steps={ckpt_every_n_steps or 'disabled'}  "
+          f"(resume from: {out_dir / 'latest.pt'})\n")
 
-    for epoch in range(start_epoch, n_epochs):
-        t0 = time.time()
-        print(f"Epoch {epoch+1}/{n_epochs}", flush=True)
+    try:
+        for epoch in range(start_epoch, n_epochs):
+            t0 = time.time()
+            print(f"Epoch {epoch+1}/{n_epochs}", flush=True)
 
-        _train_epoch(
-            epoch=epoch,
-            vae=vae,
-            discriminator=discriminator,
-            train_loader=train_loader,
-            vae_optim=vae_optim,
-            disc_optim=disc_optim,
-            loss_fn=loss_fn,
-            scaler_vae=scaler_vae,
-            scaler_disc=scaler_disc,
-            device=device,
-            grad_accum_steps=grad_accum,
-            use_amp=use_amp,
-            writer=writer,
-            global_step=global_step,
-        )
-
-        elapsed = time.time() - t0
-        print(f"  Epoch time: {elapsed:.1f}s", flush=True)
-
-        # ── Validation ──────────────────────────────────────────────────────
-        if (epoch + 1) % val_every == 0 or epoch == n_epochs - 1:
-            val_log = _val_epoch(vae, val_loader, loss_fn, device, use_amp)
-            val_loss = val_log.get("loss/total", math.inf)
-            print(f"  Val loss: {val_loss:.4f}  "
-                  f"(mae={val_log.get('loss/mae',0):.4f}  "
-                  f"kl={val_log.get('loss/kl',0):.6f})", flush=True)
-
-            for k, v in val_log.items():
-                writer.add_scalar(f"val/{k}", v, epoch)
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                _save_checkpoint(
-                    out_dir, epoch, vae, discriminator,
-                    vae_optim, disc_optim, best_val_loss, tag="best"
-                )
-
-        # ── Regular checkpoint ───────────────────────────────────────────────
-        if (epoch + 1) % ckpt_every == 0:
-            _save_checkpoint(
-                out_dir, epoch, vae, discriminator,
-                vae_optim, disc_optim, best_val_loss
+            _train_epoch(
+                epoch=epoch,
+                vae=vae,
+                discriminator=discriminator,
+                train_loader=train_loader,
+                vae_optim=vae_optim,
+                disc_optim=disc_optim,
+                loss_fn=loss_fn,
+                scaler_vae=scaler_vae,
+                scaler_disc=scaler_disc,
+                device=device,
+                grad_accum_steps=grad_accum,
+                use_amp=use_amp,
+                writer=writer,
+                global_step=global_step,
+                out_dir=out_dir,
+                checkpoint_every_n_steps=ckpt_every_n_steps,
+                best_val_loss=best_val_loss,
             )
 
-    # ── Final checkpoint ─────────────────────────────────────────────────────
-    _save_checkpoint(
-        out_dir, n_epochs - 1, vae, discriminator,
-        vae_optim, disc_optim, best_val_loss, tag="final"
-    )
+            elapsed = time.time() - t0
+            print(f"  Epoch time: {elapsed:.1f}s", flush=True)
+
+            # ── Validation ──────────────────────────────────────────────────
+            if (epoch + 1) % val_every == 0 or epoch == n_epochs - 1:
+                val_log = _val_epoch(vae, val_loader, loss_fn, device, use_amp)
+                val_loss = val_log.get("loss/total", math.inf)
+                print(f"  Val loss: {val_loss:.4f}  "
+                      f"(mae={val_log.get('loss/mae',0):.4f}  "
+                      f"kl={val_log.get('loss/kl',0):.6f})", flush=True)
+
+                for k, v in val_log.items():
+                    writer.add_scalar(f"val/{k}", v, epoch)
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    _save_checkpoint(
+                        out_dir, epoch, vae, discriminator, vae_optim, disc_optim,
+                        scaler_vae, scaler_disc, global_step[0], best_val_loss,
+                        epoch_complete=True, tag="best",
+                    )
+
+            # ── Regular end-of-epoch checkpoint ───────────────────────────────
+            if (epoch + 1) % ckpt_every == 0:
+                _save_checkpoint(
+                    out_dir, epoch, vae, discriminator, vae_optim, disc_optim,
+                    scaler_vae, scaler_disc, global_step[0], best_val_loss,
+                    epoch_complete=True,
+                )
+
+        # ── Final checkpoint ─────────────────────────────────────────────────
+        _save_checkpoint(
+            out_dir, n_epochs - 1, vae, discriminator, vae_optim, disc_optim,
+            scaler_vae, scaler_disc, global_step[0], best_val_loss,
+            epoch_complete=True, tag="final",
+        )
+        print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
+
+    except TrainingInterrupted as e:
+        # _train_epoch already saved out_dir/latest.pt before raising this -- just exit cleanly
+        # instead of printing a scary traceback for what is, on a shared machine, routine.
+        print(f"\nTraining stopped early: {e}")
+        print(f"Resume any time with: --resume {out_dir / 'latest.pt'}")
 
     writer.close()
-    print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
     print(f"Checkpoints and logs in: {out_dir}")
 
 
@@ -544,6 +684,12 @@ def _parse_args() -> argparse.Namespace:
                    help="Probability a tumor-sample patch is centered on a real nodule voxel "
                         "instead of a uniform-random crop (default: data_config.yaml "
                         "patch.nodule_centered_prob). Ignored if --patch-size is unset.")
+    p.add_argument("--checkpoint-every-n-steps", type=int, default=None,
+                   help="Save a full-state 'latest.pt' safety checkpoint every N optimiser "
+                        "steps, in addition to end-of-epoch checkpoints (default: "
+                        "vae_config.yaml training.checkpoint_every_n_steps, 50). Recommended on "
+                        "a shared machine -- bounds worst-case lost progress to this many steps "
+                        "even on a hard kill. 0 disables. Resume with --resume <out-dir>/latest.pt")
     return p.parse_args()
 
 
@@ -562,4 +708,5 @@ if __name__ == "__main__":
         device_override  = args.device,
         patch_size       = args.patch_size,
         nodule_centered_prob = args.nodule_centered_prob,
+        checkpoint_every_n_steps = args.checkpoint_every_n_steps,
     )

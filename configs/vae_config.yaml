@@ -44,6 +44,12 @@ training:
   gradient_accumulation_steps: 4  # paper trains on a 20GB GPU at batch 1; smaller GPUs need accumulation
   val_every_n_epochs: 5
   checkpoint_every_n_epochs: 5
+  # Added for shared-machine safety (see NOTES.md): saves a full-state `latest.pt` (weights,
+  # both optimisers, AMP scalers, epoch, global_step) every N optimiser steps, on top of the
+  # normal end-of-epoch checkpoints above. This bounds worst-case lost progress to this many
+  # steps, no matter how the process dies (including a hard kill that no signal handler can
+  # catch -- closed terminal window, `taskkill /F`, etc). Set to 0 or null to disable.
+  checkpoint_every_n_steps: 50
   discriminator_warmup_epochs: 10   # start adversarial loss after encoder/decoder have stabilized
 
 hardware:
