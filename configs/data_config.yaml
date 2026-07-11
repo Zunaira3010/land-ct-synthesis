@@ -53,3 +53,19 @@ dataloader:
   batch_size: 1        # paper uses batch size 1 for both VAE and diffusion U-Net training
   num_workers: 4
   pin_memory: true
+
+patch:
+  # Added after the 8GB dev-card OOM on the full 256^3 encoder forward pass (see NOTES.md):
+  # the first ResBlock conv alone needs 54GB at 256^3. Training (and, later, inference) runs on
+  # cubic crops of this size instead of the full volume. Must divide evenly by
+  # mask_encoding.mask_downsample_factor (4) -- 128 and 96 both do.
+  #   128^3 -> ~6.75GB for that same conv op (workable on 8GB with room for the rest of the model)
+  #   96^3  -> ~2.8GB  (more headroom, smaller receptive-field context per patch)
+  # Set to `null` to disable patching and use full 256^3 volumes (will OOM on <~24GB cards).
+  size: 128
+  # Fraction of patches (tumor samples only -- healthy samples have no nodule voxels to center
+  # on) centered on a real nodule voxel instead of placed uniformly at random. Nodules are a
+  # small fraction of total lung volume, so plain random crops at 96-128^3 would often contain
+  # zero nodule voxels -- a real quality risk for a model meant to eventually generate
+  # convincing synthetic nodules, not something to defer to "later, once patching works."
+  nodule_centered_prob: 0.7

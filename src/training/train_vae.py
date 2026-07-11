@@ -16,23 +16,29 @@ Our additions (not paper-specified, but needed to fit on real hardware):
   - Discriminator warm-up (10 epochs)       [INFERRED]
   - Checkpoint + val every N epochs         [INFERRED]
   - TensorBoard logging                     [INFERRED]
+  - Patch-based training (default 128^3, nodule-aware sampling) [ADDED — full 256^3 OOMs on the
+    first encoder conv at 54GB, checkpointing doesn't help since that's a forward-pass op; see
+    configs/data_config.yaml `patch:` and NOTES.md]
 
 See docs/04_training.md for the "literal vs practical" discussion.
 
 Usage
 -----
-    # Full run (100 epochs, all data):
+    # Full run (100 epochs, all data, patch settings from data_config.yaml -- default 128^3):
     python -m src.training.train_vae \
         --manifest data/processed/land/manifest.json \
         --cache-dir data/processed/land/cache \
         --out-dir checkpoints/vae
 
-    # Quick smoke-test (2 epochs, first 8 patients, CPU-friendly):
+    # Quick smoke-test (2 epochs, first 8 patients, 128^3 patches -- fits on an 8GB card):
     python -m src.training.train_vae \
         --manifest data/processed/land/manifest.json \
         --cache-dir data/processed/land/cache \
         --out-dir checkpoints/vae_smoke \
-        --epochs 2 --limit 8 --no-lpips
+        --epochs 2 --limit 8 --no-lpips --patch-size 128
+
+    # Even tighter memory budget:
+    python -m src.training.train_vae ... --patch-size 96
 
     # Override any config value from the CLI (OmegaConf dotlist):
     python -m src.training.train_vae ... vae.training.learning_rate=5e-5
@@ -88,6 +94,9 @@ def _build_dataset(
     cache_dir: str,
     split: str = "train",
     limit: int | None = None,
+    patch_size: int | None = None,
+    nodule_centered_prob: float = 0.0,
+    val_seed: int | None = None,
 ) -> LIDCVolumeDataset:
     with open(manifest_path) as f:
         splits = json.load(f)
@@ -105,7 +114,13 @@ def _build_dataset(
         )
         for e in entries
     ]
-    return LIDCVolumeDataset(samples, cache_dir=cache_dir)
+    return LIDCVolumeDataset(
+        samples,
+        cache_dir=cache_dir,
+        patch_size=patch_size,
+        nodule_centered_prob=nodule_centered_prob,
+        val_seed=val_seed,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +313,8 @@ def train(
     limit: int | None = None,
     no_lpips: bool = False,
     device_override: str | None = None,
+    patch_size: int | None = None,
+    nodule_centered_prob: float | None = None,
 ) -> None:
     """
     Main VAE training entry point.
@@ -314,6 +331,13 @@ def train(
     limit            : only use the first N training samples (smoke-test)
     no_lpips         : disable LPIPS loss (faster, useful for debugging)
     device_override  : force a specific device ('cpu', 'cuda', 'mps')
+    patch_size       : crop each scan to this cube size for train+val instead of using the full
+                        256^3 volume (default: from data_config.yaml `patch.size`, which is None
+                        i.e. full-volume -- override here or via --patch-size). Needed on 8GB
+                        cards: the first encoder conv at full 256^3 needs 54GB, see NOTES.md.
+    nodule_centered_prob : probability a tumor-sample patch is centered on a real nodule voxel
+                        instead of a uniform-random crop (default: from data_config.yaml
+                        `patch.nodule_centered_prob`). Ignored if patch_size is None.
     """
     # ── Config ──────────────────────────────────────────────────────────────
     cfg = load_config(vae=vae_config_path, data=data_config_path)
@@ -327,16 +351,33 @@ def train(
     grad_accum= int(train_cfg.gradient_accumulation_steps)
     use_amp   = (train_cfg.mixed_precision == "bf16") and (device == "cuda")
 
+    patch_cfg = getattr(cfg.data, "patch", None)
+    resolved_patch_size = patch_size if patch_size is not None else (
+        int(patch_cfg.size) if patch_cfg is not None and patch_cfg.size is not None else None
+    )
+    resolved_nodule_prob = nodule_centered_prob if nodule_centered_prob is not None else (
+        float(patch_cfg.nodule_centered_prob) if patch_cfg is not None else 0.0
+    )
+
     print(f"\n{'='*60}")
     print(f"  LAND VAE Training")
     print(f"  device={device}  epochs={n_epochs}  amp={use_amp}")
     print(f"  grad_accum={grad_accum}  limit={limit}")
+    print(f"  patch_size={resolved_patch_size or 'full-volume (256^3)'}  "
+          f"nodule_centered_prob={resolved_nodule_prob}")
     print(f"{'='*60}\n")
 
     # ── Dataset / DataLoader ─────────────────────────────────────────────────
-    train_dataset = _build_dataset(manifest_path, cache_dir, split="train", limit=limit)
-    val_dataset   = _build_dataset(manifest_path, cache_dir, split="val",
-                                   limit=max(limit // 4, 1) if limit else None)
+    train_dataset = _build_dataset(
+        manifest_path, cache_dir, split="train", limit=limit,
+        patch_size=resolved_patch_size, nodule_centered_prob=resolved_nodule_prob,
+    )
+    val_dataset   = _build_dataset(
+        manifest_path, cache_dir, split="val",
+        limit=max(limit // 4, 1) if limit else None,
+        patch_size=resolved_patch_size, nodule_centered_prob=resolved_nodule_prob,
+        val_seed=42,  # deterministic per-sample patch -> val loss comparable across epochs
+    )
 
     train_loader = DataLoader(
         train_dataset,
@@ -495,6 +536,14 @@ def _parse_args() -> argparse.Namespace:
                    help="Disable LPIPS loss (faster, good for quick debug runs)")
     p.add_argument("--device",    type=str, default=None,
                    help="Force device: cuda / cpu / mps")
+    p.add_argument("--patch-size", type=int, default=None,
+                   help="Crop scans to this cube size (train+val) instead of full 256^3 "
+                        "(default: data_config.yaml patch.size). Use e.g. 128 or 96 on an "
+                        "8GB card -- full 256^3 OOMs on the first encoder conv (needs 54GB).")
+    p.add_argument("--nodule-centered-prob", type=float, default=None,
+                   help="Probability a tumor-sample patch is centered on a real nodule voxel "
+                        "instead of a uniform-random crop (default: data_config.yaml "
+                        "patch.nodule_centered_prob). Ignored if --patch-size is unset.")
     return p.parse_args()
 
 
@@ -511,4 +560,6 @@ if __name__ == "__main__":
         limit            = args.limit,
         no_lpips         = args.no_lpips,
         device_override  = args.device,
+        patch_size       = args.patch_size,
+        nodule_centered_prob = args.nodule_centered_prob,
     )
