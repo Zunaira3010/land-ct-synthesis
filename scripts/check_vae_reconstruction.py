@@ -36,6 +36,17 @@ Notes:
 """
 from __future__ import annotations
 
+import os
+# Must be set BEFORE numpy/torch/matplotlib are imported. Works around a common conda + PyTorch +
+# Intel MKL conflict on Windows ("OMP: Error #15: Initializing libomp.dll, but found libiomp5md.dll
+# already initialized") where numpy's MKL build and PyTorch's bundled OpenMP runtime both try to
+# load. This is the same unsafe-but-standard workaround the error message itself suggests -- fine
+# for this script since it's a single-threaded, offline analysis/plotting job, not a place where
+# silently-wrong parallel numerics would be dangerous. If you'd rather not rely on this, the cleaner
+# long-term fix is reconciling the two OpenMP runtimes in the `land-ct` conda env (e.g.
+# `conda install nomkl`) -- not necessary just to get this script running today.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import argparse
 import json
 from pathlib import Path
