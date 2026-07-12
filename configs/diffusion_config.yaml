@@ -14,7 +14,12 @@ architecture:
   channels: [64, 128, 256, 384, 512]
   attention_levels: [false, false, true, true, true]   # cross-attention only at coarser levels, standard LDM practice
   num_head_channels: 64
-  cross_attention_dim: 8       # conditioning mask has 1 channel (lung+nodule combined); adjust once mask encoder is finalized
+  # Mask encoder finalized (docs/06_open_questions.md #9, Option A): the 1-channel mask is
+  # flattened to a token sequence and linear-projected to this dim before cross-attention.
+  # 64 matches the finest U-Net channel width -- a reasonable default since the paper doesn't
+  # specify a value; revisit only if attention-layer capacity looks like a bottleneck once
+  # diffusion training actually starts.  [INFERRED]
+  cross_attention_dim: 64
   norm_num_groups: 32
 
 conditioning:

@@ -92,6 +92,12 @@ def _collate(batch: list[dict]) -> dict:
 # Time formatting (elapsed / ETA reporting)
 # ---------------------------------------------------------------------------
 
+# Fixed width the in-place \r progress line is padded to. Longest realistic content is
+# "    step 999/999 (100.0%) | epoch elapsed 2h 59m 59s | epoch ETA 2h 59m 59s" (~76 chars);
+# 90 leaves comfortable headroom without being so wide it wraps on a narrow terminal.
+PROGRESS_LINE_WIDTH = 90
+
+
 def _format_duration(seconds: float) -> str:
     """e.g. 7384.2 -> '2h 3m 4s'. Drops leading zero units for readability."""
     seconds = max(0, int(seconds))
@@ -386,15 +392,20 @@ def _train_epoch(
                 _save_latest(f"periodic, every {checkpoint_every_n_steps} steps")
 
         # ── Live progress line (overwrites in place, doesn't spam the terminal) ──────────
+        # Padded to a fixed width (PROGRESS_LINE_WIDTH) so a shorter new line fully overwrites
+        # a longer previous one under \r -- cmd.exe (and most terminals) don't clear the rest
+        # of the line on \r by themselves, so without padding a stray trailing character from
+        # the previous, longer-duration-string line (e.g. "58s" -> "1m" losing a char) can be
+        # left behind uncovered.
         step_elapsed = time.time() - epoch_t0
         avg_step_time = step_elapsed / (step + 1)
         steps_left = n_batches - (step + 1)
         eta_this_epoch = avg_step_time * steps_left
-        print(f"\r    step {step+1}/{n_batches} "
-              f"({100*(step+1)/n_batches:5.1f}%) | "
-              f"epoch elapsed {_format_duration(step_elapsed)} | "
-              f"epoch ETA {_format_duration(eta_this_epoch)}",
-              end="", flush=True)
+        progress_line = (f"    step {step+1}/{n_batches} "
+                          f"({100*(step+1)/n_batches:5.1f}%) | "
+                          f"epoch elapsed {_format_duration(step_elapsed)} | "
+                          f"epoch ETA {_format_duration(eta_this_epoch)}")
+        print(f"\r{progress_line.ljust(PROGRESS_LINE_WIDTH)}", end="", flush=True)
 
         # ── Graceful-interrupt check (Ctrl+C / SIGTERM -- NOT a hard kill, see note above) ──
         if _shutdown_requested[0]:
