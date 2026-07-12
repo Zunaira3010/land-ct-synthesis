@@ -49,8 +49,39 @@ and calling it a reproduction.
 
 - Paper's reference hardware: single 20GB A100 (arXiv) / 10–16GB per the published Sci Rep
   revision.
-- Available hardware: local GTX 1080 (8GB) for debugging/dev only — cannot fit training.
-- Training requires a rented GPU (24GB card comfortably covers both stages). Budget roughly:
-  VAE 100 epochs + diffusion 500k steps at batch 1 is a substantial compute bill — will scope an
-  MVP run (reduced epochs/steps on a data subset) before committing to a full-scale run, to
-  validate the pipeline is correct before spending the bulk of the compute budget.
+- **UPDATED — this section was stale.** It previously assumed the local GTX 1080 (8GB) could
+  only be used for debugging/dev, and that training would require a rented GPU. That's been
+  disproven directly: Stage A (VAE) completed a full, real 100-epoch training run on this exact
+  card (best val loss 0.0725 at epoch 84), and Stage B (diffusion) has run real, successful
+  smoke-test training steps on it too (see below). No rented GPU has been needed for either
+  stage. The patch-based training strategy (Stage A: 96³ CT patches; Stage B: patch-cropped
+  latents, see below) is *why* this fits — not a fallback that was avoided.
+
+## Stage B step count — [DEVIATION] from the paper's literal 500,000 steps
+
+**[PAPER]** specifies 500,000 training steps, batch size 1, on a 20GB A100.
+
+**Measured on the actual hardware (GTX 1080, 8GB, patch-cropped 32³ latents out of the full
+64³, gradient checkpointing + bf16 + grad-accum=4):** ~10s/step. At the literal 500k-step
+target, that's **~58 days of continuous, uninterrupted training** — not viable on a card shared
+with a labmate, and arguably not a meaningful "faithful reproduction" target anyway, since:
+  1. The paper's compute budget was tuned for its own (larger) training dataset; we have 61
+     training patients, a small dataset by comparison, where 500k steps risks overfitting long
+     before it risks undertraining.
+  2. A secondary finding worth recording: per-step time only grew ~3.6x (2.8s → 10s) going from
+     patch_size=16 to patch_size=32 (8x more voxels), suggesting a meaningful chunk of per-step
+     cost is fixed overhead (EMA update over all 124M params, optimizer step, data loading) —
+     not pure conv compute. This means further shrinking patch_size is unlikely to buy
+     proportional speedup, and isn't the lever to pull if more speed is needed later.
+
+**Practical deviation adopted:** rather than committing to a fixed step count up front (neither
+the literal 500k, nor an arbitrarily-smaller guessed number), train in checkpointed milestones
+and evaluate actual generated-sample quality at each one, stopping when quality plateaus or
+starts degrading (the standard small-dataset overfitting signal) rather than at a predetermined
+step count. First milestone: ~20,000–30,000 steps (~2.3–3.5 days at the measured rate) as an
+initial look, not a target believed sufficient on its own.
+
+This mirrors the same kind of hardware-driven, explicitly-documented call already made at Stage
+A (patch-based training instead of full-volume) and in HU-window verification (Q#10) — a
+reasoned adaptation to real constraints, logged here rather than silently deviating and calling
+the result a literal reproduction.
