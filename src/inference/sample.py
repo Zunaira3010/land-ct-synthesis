@@ -26,6 +26,8 @@ vs. its own encode_full_volume, or check_vae_reconstruction.py's structure).
 """
 from __future__ import annotations
 
+import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -46,6 +48,31 @@ MASK_DOWNSAMPLE_FACTOR = 4
 LATENT_PATCH_SIZE = CT_PATCH_SIZE // MASK_DOWNSAMPLE_FACTOR   # 24
 LATENT_STRIDE = LATENT_PATCH_SIZE - 8                          # 16, 8-voxel overlap in latent space
 CT_STRIDE = LATENT_STRIDE * MASK_DOWNSAMPLE_FACTOR              # 64, 32-voxel overlap in CT space
+
+
+# ---------------------------------------------------------------------------
+# Elapsed/ETA display -- deliberately duplicated from src.training.train_diffusion's
+# _format_duration/_format_clock_eta (same tiny, dependency-free functions) rather than
+# imported, so this inference-only module doesn't pull in the training script's imports just
+# for two formatting helpers. Keep the output format identical to training's so "elapsed ... |
+# ETA ... | finish ..." looks the same whether you're watching a train or a sample run.
+# ---------------------------------------------------------------------------
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def _format_clock_eta(seconds_from_now: float) -> str:
+    import datetime
+    eta = datetime.datetime.now() + datetime.timedelta(seconds=max(0, seconds_from_now))
+    return eta.strftime("%a %H:%M")
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +178,40 @@ def build_conditioning_mask(
 # Reverse diffusion (full 64^3 latent -- not patch-tiled, see module docstring)
 # ---------------------------------------------------------------------------
 
+def _save_resume_state(
+    resume_path: Path,
+    x: torch.Tensor,
+    last_completed_step_idx: int,
+    seed: int | None,
+    latent_shape: tuple,
+    num_inference_steps: int,
+    guidance_scale: float,
+) -> None:
+    """Persist enough state to continue sampling from the next step after a crash/pause --
+    same atomic write pattern train_diffusion.py's _save_checkpoint uses (write to a .tmp file,
+    then os.replace onto the real path), so a hard kill mid-write can never leave a half-written,
+    unreadable resume file sitting where a real one is expected. Bounds worst-case lost sampling
+    progress to `checkpoint_every_n_steps` steps, exactly like the training script's own
+    checkpoint_every_n_steps does for training progress."""
+    resume_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = resume_path.with_suffix(resume_path.suffix + ".tmp")
+    torch.save({
+        "x": x.cpu(),
+        "last_completed_step_idx": last_completed_step_idx,
+        "seed": seed,
+        "latent_shape": tuple(latent_shape),
+        "num_inference_steps": num_inference_steps,
+        "guidance_scale": guidance_scale,
+    }, tmp_path)
+    os.replace(tmp_path, resume_path)
+
+
+def _load_resume_state(resume_path: Path) -> dict | None:
+    if not resume_path.exists():
+        return None
+    return torch.load(resume_path, map_location="cpu", weights_only=False)
+
+
 @torch.no_grad()
 def run_diffusion_sampling(
     unet: UNet3D,
@@ -161,7 +222,9 @@ def run_diffusion_sampling(
     guidance_scale: float = 1.0,
     device: str = "cpu",
     seed: int | None = None,
-    progress_every: int = 100,
+    progress_every: int = 10,
+    resume_path: str | Path | None = None,
+    checkpoint_every_n_steps: int = 25,
 ) -> torch.Tensor:
     """
     Full ancestral DDPM reverse process, from pure noise x_T down to x_0, at full latent
@@ -180,19 +243,21 @@ def run_diffusion_sampling(
     literally skipping timesteps in the reverse loop; NOT the same schedule the model was
     trained against, so treat this as an explicit, non-paper-faithful speed/quality trade if
     used, not a free lunch.
+
+    resume_path: if given and the file exists, sampling picks up from the step after whatever
+    was last checkpointed there instead of starting over from fresh noise -- same "bound the
+    worst case" spirit as train_diffusion.py's checkpoint_every_n_steps, applied to sampling
+    (which, at 1000 sequential forward passes, is itself a long enough run on a single GPU to
+    want the same crash/pause protection training already gets). seed/latent_shape/
+    num_inference_steps/guidance_scale in the resume file are checked against the current call's
+    values; a mismatch raises rather than silently resuming under different settings than what
+    produced the saved state.
     """
     if num_inference_steps is None:
         num_inference_steps = schedule.num_train_timesteps
 
-    # Generator must live on the same device as the tensors it's seeding noise for --
-    # torch.randn(..., device="cuda", generator=<cpu generator>) raises a RuntimeError rather
-    # than silently working, so this can't be a CPU generator whenever device="cuda".
-    generator = torch.Generator(device=device)
-    if seed is not None:
-        generator.manual_seed(seed)
-
-    x = torch.randn(latent_shape, generator=generator, device=device)
-    zero_mask = torch.zeros_like(mask)
+    resume_path = Path(resume_path) if resume_path is not None else None
+    resumed_state = _load_resume_state(resume_path) if resume_path else None
 
     # Evenly-spaced subset of the full [0, num_train_timesteps) range, walked in reverse.
     # With num_inference_steps == num_train_timesteps (the paper-faithful default) this is
@@ -202,7 +267,51 @@ def run_diffusion_sampling(
     ).round().long().unique()
     step_indices = torch.flip(step_indices, dims=[0])
 
-    for i, step in enumerate(step_indices):
+    if resumed_state is not None:
+        mismatches = []
+        if resumed_state["seed"] != seed:
+            mismatches.append(f"seed (saved={resumed_state['seed']}, requested={seed})")
+        if resumed_state["latent_shape"] != tuple(latent_shape):
+            mismatches.append(f"latent_shape (saved={resumed_state['latent_shape']}, requested={tuple(latent_shape)})")
+        if resumed_state["num_inference_steps"] != num_inference_steps:
+            mismatches.append(f"num_inference_steps (saved={resumed_state['num_inference_steps']}, requested={num_inference_steps})")
+        if resumed_state["guidance_scale"] != guidance_scale:
+            mismatches.append(f"guidance_scale (saved={resumed_state['guidance_scale']}, requested={guidance_scale})")
+        if mismatches:
+            raise ValueError(
+                f"Resume file {resume_path} doesn't match this call's settings -- refusing to "
+                f"resume with mismatched {', '.join(mismatches)}. Either match the original "
+                f"settings, or delete the resume file to start fresh."
+            )
+        x = resumed_state["x"].to(device)
+        start_idx = resumed_state["last_completed_step_idx"] + 1
+        print(f"Resuming sampling from {resume_path}: step {start_idx + 1}/{len(step_indices)} "
+              f"(step {resumed_state['last_completed_step_idx'] + 1} of {len(step_indices)} "
+              f"was already completed before the previous run stopped)")
+    else:
+        generator_seed_only = torch.Generator(device=device)
+        if seed is not None:
+            generator_seed_only.manual_seed(seed)
+        x = torch.randn(latent_shape, generator=generator_seed_only, device=device)
+        start_idx = 0
+
+    # Generator must live on the same device as the tensors it's seeding noise for --
+    # torch.randn(..., device="cuda", generator=<cpu generator>) raises a RuntimeError rather
+    # than silently working. Re-seeded here (rather than reusing generator_seed_only above)
+    # so behavior is identical whether this is a fresh run or a resumed one -- a resumed run's
+    # RNG stream restarts from `seed` at the resume point rather than trying to replay the
+    # exact original RNG sequence, which isn't reproducible across a process restart anyway.
+    generator = torch.Generator(device=device)
+    if seed is not None:
+        generator.manual_seed(seed + start_idx)  # vary by start_idx so resumed segments don't reuse identical noise
+    zero_mask = torch.zeros_like(mask)
+
+    total_steps = len(step_indices)
+    t0 = time.time()
+    last_saved_idx = start_idx - 1
+
+    for i in range(start_idx, total_steps):
+        step = step_indices[i]
         t_batch = torch.full((latent_shape[0],), int(step.item()), dtype=torch.long, device=device)
 
         v_cond = unet(x, t_batch, mask)
@@ -214,8 +323,28 @@ def run_diffusion_sampling(
 
         x = schedule.ddpm_reverse_step(x, v_pred, t_batch, generator=generator)
 
-        if progress_every and (i % progress_every == 0 or i == len(step_indices) - 1):
-            print(f"  sampling step {i + 1}/{len(step_indices)} (t={int(step.item())})", flush=True)
+        steps_done_this_run = i - start_idx + 1
+        if progress_every and (steps_done_this_run % progress_every == 0 or i == total_steps - 1):
+            elapsed = time.time() - t0
+            remaining_steps = total_steps - 1 - i
+            per_step = elapsed / steps_done_this_run
+            eta_seconds = per_step * remaining_steps
+            print(f"  sampling step {i + 1}/{total_steps} (t={int(step.item())}) | "
+                  f"elapsed {_format_duration(elapsed)} | "
+                  f"ETA {_format_duration(eta_seconds)} | "
+                  f"finish {_format_clock_eta(eta_seconds)}", flush=True)
+
+        if resume_path and checkpoint_every_n_steps and (
+            (i - last_saved_idx) >= checkpoint_every_n_steps or i == total_steps - 1
+        ):
+            _save_resume_state(resume_path, x, i, seed, tuple(latent_shape), num_inference_steps, guidance_scale)
+            last_saved_idx = i
+
+    if resume_path and resume_path.exists():
+        # Sampling finished cleanly -- remove the resume file so a later run with different
+        # settings (or a genuinely fresh regeneration) doesn't mistake a *completed* run's
+        # leftover state for an *interrupted* one to resume from.
+        resume_path.unlink()
 
     return x
 
@@ -361,6 +490,55 @@ def _self_test() -> None:
         "guidance_scale had no effect on output even with a mask-sensitive model -- real bug"
     print(f"  run_diffusion_sampling guidance_scale (1.0 vs 1.5, mask-sensitive fake model): "
           f"PASS, outputs differ as expected")
+
+    # ---- 2b. resume: an interrupted run + resume reaches the same total step count as an
+    # uninterrupted run, and refuses to resume under different settings ----
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        resume_path = Path(tmpdir) / "resume_test.pt"
+
+        # "Crash" partway: only 8 of 20 steps get checkpointed (checkpoint_every_n_steps=4
+        # -> saves after step 4 and step 8), simulated by monkeypatching the total step count
+        # down for this first call only via num_inference_steps, then resuming into a longer run.
+        first_leg = run_diffusion_sampling(
+            tiny_unet, schedule, mask_8, latent_shape=(1, 4, 8, 8, 8),
+            num_inference_steps=8, guidance_scale=1.0, device=device, seed=3,
+            progress_every=0, resume_path=resume_path, checkpoint_every_n_steps=4,
+        )
+        # A real crash never lets run_diffusion_sampling return normally partway through --
+        # it dies mid-loop, and the resume file is simply whatever was last checkpointed on
+        # disk. Since first_leg above ran its (shorter) schedule to completion, it already
+        # cleaned up resume_path per the "finished cleanly" branch -- recreate a genuinely
+        # partial resume file directly to test the actual resume-from-partial-file path.
+        assert not resume_path.exists(), "a fully-completed run should have cleaned up its resume file"
+        partial_x = torch.randn(1, 4, 8, 8, 8)
+        _save_resume_state(resume_path, partial_x, last_completed_step_idx=11, seed=3,
+                            latent_shape=(1, 4, 8, 8, 8), num_inference_steps=20, guidance_scale=1.0)
+
+        resumed_result = run_diffusion_sampling(
+            tiny_unet, schedule, mask_8, latent_shape=(1, 4, 8, 8, 8),
+            num_inference_steps=20, guidance_scale=1.0, device=device, seed=3,
+            progress_every=0, resume_path=resume_path, checkpoint_every_n_steps=4,
+        )
+        assert resumed_result.shape == (1, 4, 8, 8, 8)
+        assert torch.isfinite(resumed_result).all()
+        assert not resume_path.exists(), "resume file should be cleaned up after completing"
+
+        # Mismatched settings on resume must raise, not silently resume under the wrong config.
+        _save_resume_state(resume_path, partial_x, last_completed_step_idx=5, seed=3,
+                            latent_shape=(1, 4, 8, 8, 8), num_inference_steps=20, guidance_scale=1.0)
+        try:
+            run_diffusion_sampling(
+                tiny_unet, schedule, mask_8, latent_shape=(1, 4, 8, 8, 8),
+                num_inference_steps=20, guidance_scale=2.0,  # mismatched on purpose
+                device=device, seed=3, progress_every=0, resume_path=resume_path,
+            )
+            raise AssertionError("expected a ValueError for mismatched resume settings")
+        except ValueError as e:
+            assert "guidance_scale" in str(e)
+        resume_path.unlink(missing_ok=True)
+
+    print(f"  run_diffusion_sampling resume (partial-file resume completes; mismatch detection): PASS")
 
     # ---- 3. decode_full_volume with a tiny VAE, single-patch and multi-patch (blended) cases ----
     # 3 channel levels -> 4x downsample (256->64 in the real config), matching

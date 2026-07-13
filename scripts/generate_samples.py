@@ -144,6 +144,11 @@ def main() -> None:
                         "that predates EMA being wired in.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default=None)
+    p.add_argument("--checkpoint-every-n-steps", type=int, default=25,
+                   help="Save resumable sampling state to <out-dir>/.resume_seed<seed>.pt "
+                        "every N steps, so a crash or Ctrl+C loses at most this many steps of "
+                        "progress -- same spirit as train_diffusion.py's own "
+                        "checkpoint_every_n_steps. Set to 0 to disable.")
     args = p.parse_args()
 
     device = get_device(args.device)
@@ -193,13 +198,30 @@ def main() -> None:
         cfg.diffusion.architecture.in_channels,
         *cfg.diffusion.conditioning.mask_spatial_shape,
     )
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Named by seed (not by e.g. mask_mode/patient) so a resumed run is only ever resumed under
+    # the exact same run identity -- run_diffusion_sampling's own mismatch check backs this up
+    # by refusing to resume if seed/shape/steps/guidance don't match, but keeping the filename
+    # itself seed-scoped means two different seeds run back-to-back never even look at each
+    # other's resume file in the first place.
+    resume_path = out_dir / f".resume_seed{args.seed}.pt"
+    if resume_path.exists():
+        print(f"Found existing resume state at {resume_path} -- will continue from there "
+              f"(will error out if --seed/--num-inference-steps/--guidance-scale don't match "
+              f"what produced it; delete the file to force a fresh start instead).")
+
     print(f"Sampling: latent_shape={latent_shape}, "
           f"num_inference_steps={args.num_inference_steps or schedule.num_train_timesteps}, "
           f"guidance_scale={args.guidance_scale}, seed={args.seed}")
+    print(f"If this run is interrupted (crash, Ctrl+C, closed terminal), just re-run the exact "
+          f"same command -- it will pick up from {resume_path.name} instead of starting over "
+          f"(loses at most --checkpoint-every-n-steps={args.checkpoint_every_n_steps} steps of progress).")
     x0_latent = run_diffusion_sampling(
         unet, schedule, mask, latent_shape=latent_shape,
         num_inference_steps=args.num_inference_steps, guidance_scale=args.guidance_scale,
         device=device, seed=args.seed,
+        resume_path=resume_path, checkpoint_every_n_steps=args.checkpoint_every_n_steps,
     )
 
     # ---- Decode: sliding-window VAE decode, then denormalize back to HU ----
@@ -209,8 +231,6 @@ def main() -> None:
     ct_hu = denormalize_hu(ct_normalized)
 
     # ---- Save ----
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
     mask_64_np = mask.squeeze(0).squeeze(0).cpu().numpy()
 
     npz_path = out_dir / f"sample_seed{args.seed}.npz"
