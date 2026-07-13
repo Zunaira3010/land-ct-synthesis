@@ -184,11 +184,14 @@ def run_diffusion_sampling(
     if num_inference_steps is None:
         num_inference_steps = schedule.num_train_timesteps
 
-    generator = torch.Generator(device="cpu")
+    # Generator must live on the same device as the tensors it's seeding noise for --
+    # torch.randn(..., device="cuda", generator=<cpu generator>) raises a RuntimeError rather
+    # than silently working, so this can't be a CPU generator whenever device="cuda".
+    generator = torch.Generator(device=device)
     if seed is not None:
         generator.manual_seed(seed)
 
-    x = torch.randn(latent_shape, generator=generator).to(device)
+    x = torch.randn(latent_shape, generator=generator, device=device)
     zero_mask = torch.zeros_like(mask)
 
     # Evenly-spaced subset of the full [0, num_train_timesteps) range, walked in reverse.
