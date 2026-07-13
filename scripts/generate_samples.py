@@ -33,6 +33,19 @@ preview) for a fast visual look without needing a separate viewer.
 """
 from __future__ import annotations
 
+import os
+# Must be set BEFORE numpy/torch/matplotlib are imported. Works around a common conda + PyTorch +
+# Intel MKL conflict on Windows ("OMP: Error #15: Initializing libomp.dll, but found libiomp5md.dll
+# already initialized") where numpy's MKL build and PyTorch's bundled OpenMP runtime both try to
+# load. Same workaround check_vae_reconstruction.py already applies -- this script does the actual
+# work (sampling, decode) before this point ever mattered, but the crash happened right at the very
+# end on the PNG preview step, after the real .npz was already saved. Setting this here means the
+# whole run -- including the preview -- completes cleanly instead of needing the post-hoc one-liner
+# workaround. This is the same unsafe-but-standard fix the error message itself suggests -- fine
+# here since this script is single-threaded and this is offline analysis/plotting, not a place
+# where silently-wrong parallel numerics would be dangerous.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import argparse
 import json
 from pathlib import Path
